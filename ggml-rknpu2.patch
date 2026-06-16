@@ -1,0 +1,281 @@
+diff --git a/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp b/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+index 55ae0ca..fcdd504 100644
+--- a/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
++++ b/ggml/src/ggml-rknpu2/ggml-rknpu2.cpp
+@@ -6,6 +6,7 @@
+ #include "rknpu2-quantization.h"
+ #include "rknpu2-calibration.h"
+ #include "rknpu2-configuration.h"
++#include "tiling_cache.h"
+ 
+ #include <rknn_api.h>
+ #include <rknn_matmul_api.h>
+@@ -24,6 +25,7 @@
+ #include <random>
+ #include <limits>
+ #include <sys/mman.h>
++#include <unistd.h>
+ #include <sstream>
+ 
+ #define UNUSED(x) (void)(x)
+@@ -196,66 +198,11 @@ struct TupleHasher {
+     }
+ };
+ 
+-// --- Segmenters ---
+-
+-// Matrix segment information for N dimension
+-struct MatrixSegmentN {
+-    int offset_n;
+-    int size_n;
+-    int core_id;
+-};
+-
+-// Matrix segment information for K dimension
+-struct MatrixSegmentK {
+-    int offset_k;
+-    int size_k;
+-};
+-
+-// Split B-matrix into N-segments for cores
+-static std::vector<MatrixSegmentN> compute_n_segments(int N, const std::vector<int>& active_cores, int alignment) {
+-    std::vector<MatrixSegmentN> segments;
+-    int num_cores = active_cores.size();
+-
+-    if (num_cores == 0) return segments;
+-
+-    int base_segment_size = (N / num_cores / alignment) * alignment;
+-    int remaining = N - (base_segment_size * num_cores);
+-
+-    int offset = 0;
+-    for (int i = 0; i < num_cores; i++) {
+-        MatrixSegmentN seg;
+-        seg.offset_n = offset;
+-        seg.size_n = base_segment_size;
+-        seg.core_id = active_cores[i];
+-
+-        if (i < remaining / alignment) {
+-            seg.size_n += alignment;
+-        }
+-
+-        offset += seg.size_n;
+-        segments.push_back(seg);
+-    }
+-    return segments;
+-}
+-
+-// Split B-matrix into K-segments for hardware limit
+-static std::vector<MatrixSegmentK> compute_k_segments(int K_op, int k_limit, int alignment) {
+-    std::vector<MatrixSegmentK> segments;
+-
+-    if (k_limit <= 0 || K_op <= k_limit) {
+-        segments.push_back({0, K_op});
+-        return segments;
+-    }
+-
+-    int k_limit_aligned = (k_limit / alignment) * alignment;
+-    int offset = 0;
+-    while (offset < K_op) {
+-        int size = std::min(k_limit_aligned, K_op - offset);
+-        segments.push_back({offset, size});
+-        offset += size;
+-    }
+-    return segments;
+-}
++// --- Segmenters --- (definitions now in tiling_cache.h, aliased here) ---
++using rknpu2_tiling_cache::MatrixSegmentN;
++using rknpu2_tiling_cache::MatrixSegmentK;
++using rknpu2_tiling_cache::compute_n_segments;
++using rknpu2_tiling_cache::compute_k_segments;
+ 
+ // --- Structs ---
+ 
+@@ -327,6 +274,7 @@ struct rknpu_matmul_context {
+ 
+     bool b_bound = false;
+     std::shared_ptr<rknn_tensor_mem> mem_B;
++    bool c_bound = false;
+ 
+     rknpu_matmul_context(int M, int K, int N, rknn_matmul_type type, int32_t domain_id) {
+         memset(&info, 0, sizeof(info));
+@@ -488,39 +436,24 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+             continue;
+         }
+ 
+-        // Using next power of two for M for efficient caching
+-        int M_op = M;
+-        if (M > 1) {
+-            M_op = rknpu2_calibration::next_power_of_two(M);
+-        }
+-
++        // --- Tiling cache: lookup or compute segment parameters ---
+         const auto* pipeline = config.resolve_op_support(src0);
+         if (!pipeline) continue;
+ 
+-        // Initializing Hadamard Transform Logic
+-        const bool is_hadamard = (pipeline->use_hadamard);
+-        const int K_op = is_hadamard ? rknpu2_calibration::next_power_of_two(K) : K;
++        auto& tiling_cache = rknpu2_tiling_cache::get_tiling_cache();
++        const auto* plan = tiling_cache.get_or_compute(M, K, N, (int)pipeline->mm_type, pipeline, config);
++        if (!plan || plan->n_segments.empty()) continue;
+ 
+-        const rknn_matmul_type matmul_type = pipeline->mm_type;
+-        const int alignment = pipeline->n_align;
+-
+-        // Computing specific hardware segments
+-        int k_limit = config.max_k_limit;
+-        if (pipeline->effective_k > 0) {
+-            k_limit = (k_limit > 0) ? std::min(k_limit, pipeline->effective_k) : pipeline->effective_k;
+-        }
+-        auto all_k_segments = compute_k_segments(K_op, k_limit, pipeline->k_align);
+-        auto all_n_segments = compute_n_segments(N, config.active_cores, alignment);
+-
+-        std::vector<MatrixSegmentN> active_n_segments;
+-        for (const auto& seg : all_n_segments) {
+-            if (seg.size_n > 0) active_n_segments.push_back(seg);
+-        }
+-
+-        if (active_n_segments.empty()) continue;
++        const int M_op = plan->M_op;
++        const int K_op = plan->K_op;
++        const bool is_hadamard = plan->use_hadamard;
++        const rknn_matmul_type matmul_type = plan->matmul_type;
++        const auto& all_k_segments = plan->k_segments;
++        const auto& all_n_segments = plan->all_n_segments;
++        const auto& active_n_segments = plan->n_segments;
++        const size_t num_active_segments = plan->num_active_segments;
+ 
+         // Initializing variables
+-        const size_t num_active_segments = active_n_segments.size();
+         std::vector<std::shared_ptr<rknpu_matmul_context>> matmul_ctxs(num_active_segments);
+         std::shared_ptr<rknn_tensor_mem> mem_A_shared;
+         std::vector<std::shared_ptr<rknn_tensor_mem>> mem_C_segments(num_active_segments);
+@@ -570,55 +503,50 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+         if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_FP16) type_size_packed = 2;
+         else if (pipeline->npu_type_b == rknpu2_configuration::NPU_TYPE_INT8) type_size_packed = 1;
+ 
+-        // Computing K dimensions segments
+-        size_t current_offset_in_tensor = 0;
++        // Computing K dimensions segments (Variant C: no matching loop)
+         for (size_t k_idx = 0; k_idx < all_k_segments.size(); ++k_idx) {
+             const auto& k_seg = all_k_segments[k_idx];
+             const int K_seg_op = k_seg.size_k;
+ 
+             // ===========================================
+-            // ========== 1. Preparing Contexts ==========
++            // ========== 1. Preparing Contexts =========
+             // ===========================================
+-            for (const auto& n_seg : all_n_segments) {
+-                for (size_t idx = 0; idx < num_active_segments; ++idx) {
+-                    if (active_n_segments[idx].offset_n == n_seg.offset_n) {
+-                        size_t offset_in_dma = current_offset_in_tensor;
+-
+-                        // Getting matmul context from cache
+-                        matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
+-                            (uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
+-                            n_seg.core_id, matmul_type, b_domain_id
+-                        );
+-                        if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
+-
+-                        auto& matmul_ctx = matmul_ctxs[idx];
+-
+-                        // Assigning B-matrix only once to reduce computation overhead
+-                        if (!matmul_ctx->b_bound) {
+-                            size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
+-
+-                            rknn_tensor_mem* mem = rknn_create_mem_from_fd(
+-                                matmul_ctx->ctx,
+-                                tensor_fd,
+-                                tensor_virt_addr,
+-                                segment_size_bytes,
+-                                offset_in_dma
+-                            );
+-                            if (!mem) return GGML_STATUS_FAILED;
+-
+-                            auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
+-                            matmul_ctx->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
+-
+-                            RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
+-
+-                            matmul_ctx->b_bound = true;
+-                        }
+-                        break;
+-                    }
+-                }
+-
+-                if (n_seg.size_n > 0) {
+-                    current_offset_in_tensor += type_size_packed > 0 ? (size_t)n_seg.size_n * K_seg_op * type_size_packed : (size_t)n_seg.size_n * K_seg_op / 2;
++            for (size_t n_idx = 0; n_idx < all_n_segments.size(); ++n_idx) {
++                const auto& info = plan->b_info[k_idx][n_idx];
++                if (info.active_idx < 0) continue;  // skip inactive segment
++
++                const size_t idx = (size_t)info.active_idx;
++                const auto& n_seg = all_n_segments[n_idx];
++                size_t offset_in_dma = info.offset_in_dma;
++
++                // Getting matmul context from cache
++                matmul_ctxs[idx] = backend_ctx->get_matmul_ctx(
++                    (uintptr_t)tensor_virt_addr, offset_in_dma, M_op, K_seg_op, n_seg.size_n,
++                    n_seg.core_id, matmul_type, b_domain_id
++                );
++                if (!matmul_ctxs[idx] || matmul_ctxs[idx]->ctx == 0) return GGML_STATUS_FAILED;
++
++                auto& matmul_ctx = matmul_ctxs[idx];
++
++                // Assigning B-matrix only once to reduce computation overhead
++                if (!matmul_ctx->b_bound) {
++                    size_t segment_size_bytes = matmul_ctx->io_attr.B.size;
++
++                    rknn_tensor_mem* mem = rknn_create_mem_from_fd(
++                        matmul_ctx->ctx,
++                        tensor_fd,
++                        tensor_virt_addr,
++                        segment_size_bytes,
++                        offset_in_dma
++                    );
++                    if (!mem) return GGML_STATUS_FAILED;
++
++                    auto deleter = [ctx = matmul_ctx->ctx](rknn_tensor_mem* m) { if (m) rknn_destroy_mem(ctx, m); };
++                    matmul_ctx->mem_B = std::shared_ptr<rknn_tensor_mem>(mem, deleter);
++
++                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, matmul_ctx->mem_B.get(), &matmul_ctx->io_attr.B), "set_io_mem B segment");
++
++                    matmul_ctx->b_bound = true;
+                 }
+             }
+ 
+@@ -701,8 +629,11 @@ static enum ggml_status ggml_backend_rknpu_graph_compute(ggml_backend_t backend,
+                     mem_C_segments[idx] = get_tensor_buffer(backend_ctx, matmul_ctx->ctx, matmul_ctx->io_attr.C.size, cache_key, backend_ctx->c_buffer_cache);
+                     if (!mem_C_segments[idx]) return GGML_STATUS_FAILED;
+ 
+-                    // Assigning C-matrix to current context for the parallel execution
+-                    RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
++                    // Skip set_io_mem C if already bound (same buffer from cache)
++                    if (!matmul_ctx->c_bound) {
++                        RKNN_CHECK(rknn_matmul_set_io_mem(matmul_ctx->ctx, mem_C_segments[idx].get(), &matmul_ctx->io_attr.C), "set_io_mem C");
++                        matmul_ctx->c_bound = true;
++                    }
+                 }
+             }
+ 
+@@ -1150,6 +1081,20 @@ static void ggml_backend_rknpu_buffer_set_tensor(ggml_backend_buffer_t buffer, s
+ 
+         rknn_matmul_ctx sync_ctx = g_domain_manager.get_allocator_context(alloc.iommu_domain_id);
+         RKNN_CHECK(rknn_mem_sync(sync_ctx, alloc.mem, RKNN_MEMORY_SYNC_TO_DEVICE), "sync B TO_DEVICE");
++
++        // --- Weight cache: release GGUF mmap pages after NPU upload ---
++        // data points to GGUF mmap (MAP_SHARED, PROT_READ), not to RKNPU buffer.
++        // After mem_sync TO_DEVICE, the NPU has its own DMA copy, so GGUF pages
++        // are no longer needed for this weight tensor.
++        // madvise(MADV_DONTNEED) on MAP_SHARED releases clean pages from page cache.
++        // If the kernel re-faults them later (e.g. from CPU fallback), it re-reads from disk.
++        if (offset == 0 && data != nullptr && size > 0) {
++            uintptr_t ps = sysconf(_SC_PAGESIZE);
++            uintptr_t addr_start = (uintptr_t)data & ~(ps - 1);
++            uintptr_t addr_end = ((uintptr_t)data + size + ps - 1) & ~(ps - 1);
++            size_t aligned_size = addr_end - addr_start;
++            madvise((void*)addr_start, aligned_size, MADV_DONTNEED);
++        }
+     } else {
+         memcpy((uint8_t*)tensor->data + offset, data, size);
+     }
