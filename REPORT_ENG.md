@@ -8,8 +8,9 @@ Platform: Orange Pi 5 Max (RK3588, 16 GB RAM, 3 NPU cores @ 1 GHz)
 ## Summary
 
 Full optimization pipeline for llama.cpp with ggml-rknpu2 backend on RK3588 was investigated.
-Result: RSS reduced from 13.5 GB to 3.0 GB, decode accelerated from 3.5 to 9.1 tok/s
-(via model selection + big-core pinning). NPU compute = 80% bottleneck for dense 8B,
+Result: madvise reduces RSS from 13.5 GB to 7.5 GB (−44%) with no speed loss;
+the final 3.0 GB and 9.1 tok/s come from model selection and big-core pinning
+(taskset 0xf0 -t 4). NPU compute = 80% bottleneck for dense 8B,
 further code optimization is impossible — hardware limitation.
 
 **Best results (big cores only, taskset 0xf0 -t 4):**
@@ -25,7 +26,7 @@ further code optimization is impossible — hardware limitation.
 ### 1.1 Hardware
 
 - Orange Pi 5 Max (RK3588)
-- 16 GB LPDDR4x RAM
+- 16 GB LPDDR5 RAM
 - 4×A76 @ 2.3 GHz (big) + 4×A55 @ 1.8 GHz (LITTLE) — big.LITTLE
 - 3 NPU cores @ 1 GHz (topology0/1/2)
 - NPU: matmul up to 256×256 (K, N), M=1 for decode

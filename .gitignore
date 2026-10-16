@@ -1,0 +1,34 @@
+# --- Build artifacts (CMake / llama.cpp) ---
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Testing/
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+
+# --- Models (large binaries) ---
+*.gguf
+*.rkllm
+*.onnx
+models/
+
+# --- Python helpers ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
